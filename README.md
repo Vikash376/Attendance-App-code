@@ -1,2 +1,1 @@
-# Attendance-App-code
-It Contains the whole Management System 
+Employee Management code
