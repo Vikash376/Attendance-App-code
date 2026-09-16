@@ -1,0 +1,392 @@
+/**
+ * Employee Attendance Management System - Google Apps Script
+ * FIXED: Single page approach with dynamic content
+ */
+
+// ============================================
+// CONSTANTS & CONFIGURATION
+// ============================================
+
+const SHEETS = {
+  EMPLOYEE: 'EMPLOYEE',
+  LOCATIONS: 'LOCATIONS',
+  COMPANY_SETTINGS: 'COMPANY_SETTINGS',
+  ATTENDANCE: 'ATTENDANCE',
+  PUNCH_DETAILS: 'PUNCH_DETAILS',
+  LEAVE_HOLIDAY: 'LEAVE_HOLIDAY',
+  LEAVE_BALANCE: 'LEAVE_BALANCE',
+  NORMALIZATION: 'NORMALIZATION',
+  DASHBOARD: 'DASHBOARD'
+};
+
+// Column indices for EMPLOYEE sheet (0-based)
+const EMPLOYEE_COLS = {
+  EMPLOYEE_ID: 0,
+  NAME: 1,
+  ROLE: 2,
+  DEPARTMENT: 3,
+  EMAIL: 4,
+  PHONE: 5,
+  SHIFT_START: 6,
+  SHIFT_END: 7,
+  LUNCH_ALLOWED: 8,
+  GRACE: 9,
+  WEEKLY_OFF: 10,
+  ASSIGNED_LOCATION_ID: 11,
+  PHOTO_URL: 12,
+  STATUS: 13,
+  PIN: 14
+};
+
+// ============================================
+// SESSION MANAGEMENT - Using PropertiesService for reliability
+// ============================================
+
+function createSession(employeeId, name, role) {
+  try {
+    const token = Utilities.getUuid();
+    const sessionData = {
+      employeeId: employeeId,
+      name: name,
+      role: role,
+      loginTime: new Date().toISOString()
+    };
+    
+    // Store in both Cache and Properties for reliability
+    const cache = CacheService.getScriptCache();
+    cache.put(token, JSON.stringify(sessionData), 21600); // 6 hours
+    
+    // Also store in Properties as backup
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty('session_' + token, JSON.stringify(sessionData));
+    
+    return token;
+  } catch (error) {
+    console.error('Error creating session:', error);
+    throw error;
+  }
+}
+
+function validateSession(token) {
+  if (!token) {
+    return null;
+  }
+  
+  try {
+    // Try Cache first
+    const cache = CacheService.getScriptCache();
+    let sessionData = cache.get(token);
+    
+    // If not in cache, try Properties
+    if (!sessionData) {
+      const props = PropertiesService.getScriptProperties();
+      sessionData = props.getProperty('session_' + token);
+    }
+    
+    if (!sessionData) {
+      return null;
+    }
+    
+    return JSON.parse(sessionData);
+  } catch (error) {
+    console.error('Error validating session:', error);
+    return null;
+  }
+}
+
+function destroySession(token) {
+  try {
+    const cache = CacheService.getScriptCache();
+    cache.remove(token);
+    
+    const props = PropertiesService.getScriptProperties();
+    props.deleteProperty('session_' + token);
+    
+    return { success: true };
+  } catch (error) {
+    console.error('Error destroying session:', error);
+    return { success: false, message: error.message };
+  }
+}
+
+// ============================================
+// PERMISSION GUARDS
+// ============================================
+
+function requireAdmin(token) {
+  const session = validateSession(token);
+  if (!session) {
+    throw new Error('Session expired or invalid');
+  }
+  if (session.role !== 'Admin') {
+    throw new Error('Admin access required');
+  }
+  return session;
+}
+
+function requireEmployee(token) {
+  const session = validateSession(token);
+  if (!session) {
+    throw new Error('Session expired or invalid');
+  }
+  if (session.role !== 'Employee') {
+    throw new Error('Employee access required');
+  }
+  return session;
+}
+
+// ============================================
+// SHEET HELPERS
+// ============================================
+
+function getSpreadsheet() {
+  try {
+    return SpreadsheetApp.getActiveSpreadsheet();
+  } catch (error) {
+    console.error('Error getting spreadsheet:', error);
+    throw new Error('Could not access spreadsheet');
+  }
+}
+
+function getSheetData(sheetName) {
+  try {
+    const sheet = getSpreadsheet().getSheetByName(sheetName);
+    if (!sheet) {
+      throw new Error(`Sheet "${sheetName}" not found`);
+    }
+    return sheet.getDataRange().getValues();
+  } catch (error) {
+    console.error(`Error reading sheet "${sheetName}":`, error);
+    throw error;
+  }
+}
+
+function getCompanySettings() {
+  try {
+    const data = getSheetData(SHEETS.COMPANY_SETTINGS);
+    const settings = {};
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][0]) {
+        settings[data[i][0]] = data[i][1] || '';
+      }
+    }
+    return settings;
+  } catch (error) {
+    console.error('Error getting company settings:', error);
+    return {};
+  }
+}
+
+function getEmployeeData(employeeId) {
+  try {
+    const data = getSheetData(SHEETS.EMPLOYEE);
+    if (data.length < 2) return null;
+    
+    for (let i = 1; i < data.length; i++) {
+      const currentId = data[i][EMPLOYEE_COLS.EMPLOYEE_ID] ? data[i][EMPLOYEE_COLS.EMPLOYEE_ID].toString().trim() : '';
+      if (currentId === employeeId) {
+        return {
+          rowIndex: i,
+          data: data[i],
+          name: data[i][EMPLOYEE_COLS.NAME] || '',
+          role: data[i][EMPLOYEE_COLS.ROLE] || 'Employee',
+          status: data[i][EMPLOYEE_COLS.STATUS] || ''
+        };
+      }
+    }
+    return null;
+  } catch (error) {
+    console.error('Error getting employee data:', error);
+    return null;
+  }
+}
+
+// ============================================
+// LOGIN FUNCTIONS
+// ============================================
+
+function verifyLogin(employeeId, pin) {
+  try {
+    // Validate inputs
+    if (!employeeId || !pin) {
+      return {
+        success: false,
+        message: 'Employee ID and PIN are required'
+      };
+    }
+
+    const trimmedEmployeeId = employeeId.trim();
+    const trimmedPin = pin.trim();
+
+    // Get employee data
+    const employee = getEmployeeData(trimmedEmployeeId);
+    
+    if (!employee) {
+      return {
+        success: false,
+        message: 'Employee ID not found'
+      };
+    }
+
+    // Get PIN from column 14
+    const storedPin = employee.data[14] ? employee.data[14].toString().trim() : '';
+    
+    if (storedPin !== trimmedPin) {
+      return {
+        success: false,
+        message: 'Invalid PIN'
+      };
+    }
+
+    // Check status
+    if (employee.status.toLowerCase() === 'inactive') {
+      return {
+        success: false,
+        message: 'Account is inactive. Please contact HR.'
+      };
+    }
+
+    // Create session
+    const token = createSession(trimmedEmployeeId, employee.name, employee.role);
+
+    // Get company settings
+    const settings = getCompanySettings();
+
+    return {
+      success: true,
+      token: token,
+      name: employee.name,
+      role: employee.role,
+      employeeId: trimmedEmployeeId,
+      companyName: settings['Company Name'] || 'Company',
+      companyLogo: settings['Company Logo URL'] || ''
+    };
+
+  } catch (error) {
+    console.error('Login error:', error);
+    return {
+      success: false,
+      message: 'Login failed: ' + error.message
+    };
+  }
+}
+
+function logout(token) {
+  return destroySession(token);
+}
+
+function getSessionData(token) {
+  try {
+    const session = validateSession(token);
+    if (!session) {
+      return {
+        success: false,
+        message: 'Session expired'
+      };
+    }
+    
+    const settings = getCompanySettings();
+    
+    return {
+      success: true,
+      name: session.name,
+      role: session.role,
+      employeeId: session.employeeId,
+      companyName: settings['Company Name'] || 'Company',
+      companyLogo: settings['Company Logo URL'] || ''
+    };
+  } catch (error) {
+    console.error('Session verification error:', error);
+    return {
+      success: false,
+      message: error.message
+    };
+  }
+}
+
+// ============================================
+// TEST FUNCTIONS
+// ============================================
+
+function testLogin() {
+  const result = verifyLogin('EMP001', '9083');
+  Logger.log('Test login result: ' + JSON.stringify(result));
+  return result;
+}
+
+function testSession(token) {
+  const result = getSessionData(token);
+  Logger.log('Test session result: ' + JSON.stringify(result));
+  return result;
+}
+
+// ============================================
+// WEB APP ENTRY POINT - SINGLE PAGE
+// ============================================
+
+function doGet(e) {
+  try {
+    // Get token from URL parameter or use stored token
+    let token = e && e.parameter ? e.parameter.token : null;
+    
+    // If no token in URL, try to get from session storage via cookie (handled client-side)
+    // We'll use a simple approach - render main page with token checking logic
+    
+    const settings = getCompanySettings();
+    const template = HtmlService.createTemplateFromFile('MainPage');
+    
+    // Pass data to template
+    template.companyName = settings['Company Name'] || 'Company';
+    template.companyLogo = settings['Company Logo URL'] || '';
+    template.initialToken = token || '';
+    
+    return template.evaluate()
+      .setTitle('Employee Attendance System')
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+      
+  } catch (error) {
+    console.error('doGet error:', error);
+    return HtmlService.createHtmlOutput(`
+      <!DOCTYPE html>
+      <html>
+      <head><base target="_top"><meta charset="UTF-8"></head>
+      <body style="font-family:Arial;padding:40px;text-align:center;">
+        <h1 style="color:#e74c3c;">Error Loading Application</h1>
+        <p>${error.message}</p>
+        <button onclick="window.location.href='/'">Try Again</button>
+      </body>
+      </html>
+    `).setTitle('Error');
+  }
+}
+// Add this function to Code.gs for the stats to work
+function getEmployeeList(token) {
+  try {
+    requireAdmin(token);
+    
+    const data = getSheetData(SHEETS.EMPLOYEE);
+    const employees = [];
+    
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      employees.push({
+        employeeId: row[EMPLOYEE_COLS.EMPLOYEE_ID],
+        name: row[EMPLOYEE_COLS.NAME],
+        role: row[EMPLOYEE_COLS.ROLE],
+        department: row[EMPLOYEE_COLS.DEPARTMENT],
+        status: row[EMPLOYEE_COLS.STATUS]
+      });
+    }
+    
+    return {
+      success: true,
+      employees: employees
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: error.message
+    };
+  }
+}
